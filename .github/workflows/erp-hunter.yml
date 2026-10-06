@@ -1,0 +1,1369 @@
+name: ERP · Hunter · Timeouts + CI noise
+
+# Two daily hunts that share a schedule and nothing else. Each takes one thing
+# the per-PR gates can only refuse to make WORSE, re-derives it from the ground
+# truth, and drives the stock down.
+#
+#   hunt-timeouts — the inline `{ timeout: N }` stock in the e2e suite, read
+#                   from the TREE. Codemod + PR.
+#   hunt-noise    — the "green but not clean" residue (flaky · dup-testid ·
+#                   hydration · i18n · font · 404 · biome · vitest stderr), read
+#                   from the FLEET'S LOGS over a multi-day window. Auto-fix for
+#                   the one mechanically-fixable class, ranked report for the
+#                   rest, in a sticky `ci-noise` issue.
+#
+# Why the second one cannot be the per-PR gate: erp-ci-pr.yml's noise scan answers
+# "is THIS run clean?" and gates auto-merge on it, which is the right question
+# for a PR and the wrong one for a flake. A spec that fails one run in thirty is
+# green on every single PR — `flaky 0`, clean, merged — and unmistakable the
+# moment 40 runs across the 16 fleet repos are pooled. Same logs, same tags,
+# wider window.
+#
+# ONE JOB PER HUNT, not one job with two steps: the timeout codemod rewrites the
+# working tree, so a noise scan sharing that checkout would have to run before
+# it or read a mutated tree, and a failure in either would take the other's
+# report down with it. They also open different things (a PR vs an issue).
+#
+# Daily bite out of the inline-timeout stock: delete the `{ timeout: N }`
+# overrides that playwright.config.ts's global defaults already cover, and open a
+# PR with the batch. The full e2e suite on that PR is what judges whether the
+# batch was safe — nothing here decides that.
+#
+# The backlog is already drained — the suite sits at zero inline overrides and
+# zero per-test budgets — so on a healthy repo this reports "the stock is
+# drained" and exits without opening anything. Expected, not a fault.
+#
+# It earns its keep as the second half of a pair that fail differently: the
+# per-turn/per-PR gate refuses an INCREASE, while this re-derives the count from
+# the tree, catching anything that landed by a path the gate never saw (a direct
+# push, a merge of two individually-clean branches, a revert). Batching exists
+# for that case: one unreviewable PR's e2e run cannot be bisected, a batch names
+# the module.
+#
+# It shares BOTH its scanner and its codemod with the per-turn gate
+# (scripts/gate/shape/no-timeouts.sh, scripts/dev/strip-timeouts.mjs) rather
+# than reimplementing either — a second copy would drift, and the drift would
+# show up as the hunter cheerfully reporting nothing to do.
+#
+# Filename is deliberately NOT erp-ci-*.yml → the sync mirrors it to
+# NamThuanVn/ppap only, never to the CI fleet's 20-job budget
+# (docs/engineering/platform/ppap.md § To which workflows ppap runs).
+
+on:
+  # No `schedule:`. The daily clock moved OUT of GitHub — it delayed the schedule
+  # EVENT at its own scheduler and dropped ticks it could not place.
+  # erp-heartbeat.yml now dispatches this workflow inside a fixed nightly SLOT,
+  # driven by a Cloudflare cron on the ERP's service-utilities worker.
+  #
+  # The intent: run in the middle of the Vietnam night, when the fleet is idle
+  # and a ~1.5k-call REST sweep competes with nobody's PR CI — 01:30–06:00 ICT
+  # (18:30–23:00 UTC). This USED to be an age floor ("dispatch once the
+  # previous run is 24h old"), which reads a run that DIED as a run that
+  # happened AND drifts the slot to wherever anything — a manual dispatch, this
+  # workflow's own recall below, the ambulance — last started a run, with
+  # nothing ever pulling it back to the night (issue #4360: the sweep drifted
+  # into the Vietnam afternoon). The slot fixes that: only a run started at or
+  # after 18:30 UTC counts as tonight's sweep, so a daytime run never moves it,
+  # and the window closes for good at 23:00 UTC rather than waiting a further
+  # day. See `scripts/ci/heartbeat-due.mjs`'s `slotDueDecision`.
+  #
+  # NOTE FOR ANYONE EDITING `dry_run` BELOW: under `schedule` its value was NULL
+  # (falsy → `--apply`). Under `workflow_dispatch` GitHub substitutes the
+  # DECLARED DEFAULT, which is `true`. erp-heartbeat.yml therefore passes
+  # `-f dry_run=false` explicitly; changing the default here without changing
+  # that would silently turn the daily hunt into a no-op.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Preview the batch without opening a PR'
+        type: boolean
+        default: true
+      batch_max:
+        description: 'Approximate number of overrides to remove in one PR'
+        type: string
+        default: '400'
+      days:
+        description: 'Noise hunt: how many days of fleet CI logs to pool'
+        type: string
+        default: '7'
+      fresh_hunt:
+        description: 'When the pooled window has nothing to kill, sample main to make fresh evidence. The re-entry pass sets this false so a hunt can never chain into another.'
+        type: boolean
+        default: true
+      smoke:
+        description: 'Prove the kill job WIRING without spending a session: every step runs for real, the fixer is stubbed, and the branch is deleted at the end. Minutes instead of the ~2 hours a real run costs to surface an env or ordering fault. Nothing is merged and no PR is opened.'
+        type: boolean
+        default: false
+      round:
+        description: 'Handoff round. A session that spends its budget with its PR still open re-calls the hunter to carry on, and each re-call increments this. Bounded by MAX_ROUNDS in the recall step so a PR that cannot be finished stops asking.'
+        type: string
+        default: '1'
+      model:
+        description: 'Optional --model override for the fixer session. Empty = the stored AGENT_MODELS setting (default opus).'
+        required: false
+        default: ''
+        type: string
+      # Set by erp-heartbeat.yml when it places the hunter on a CI-fleet repo
+      # (`"repo": "@fleet"` in erp-heartbeat-schedule.json), and carried forward
+      # by the hunter's own recall / re-entry. Sealed, so showing it in the run
+      # UI publishes nothing — scripts/agent/run/secret-bundle.mjs.
+      bundle:
+        description: 'Internal: the sealed secrets bundle (scripts/agent/run/secret-bundle.mjs). Leave empty.'
+        required: false
+        default: ''
+        type: string
+      controller_repo:
+        description: 'Internal: the control repo that dispatched this run. Leave empty.'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+# FORK_REPO — the shared agent fork the kill job's session pushes through, the
+# same variable every agent lane reads, and shared on purpose so a hunter branch
+# cannot collide with a lane's — is NOT declared here any more. This workflow
+# runs on the control repo OR a CI-fleet repo (the heartbeat places it), and a
+# fleet repo has no variables, so every job takes it from its "Load hunter
+# config" step instead. It must not be re-added at workflow level: a workflow
+# `env:` key outranks $GITHUB_ENV and would blank it on the fleet. Unset still
+# means the session has nowhere to push, which the kill job refuses loudly.
+
+concurrency:
+  group: hunter
+  cancel-in-progress: false
+
+jobs:
+  hunt-timeouts:
+    name: Hunt timeouts
+    runs-on: ubuntu-latest
+    # Generous but finite. The work is a checkout, an install and an AST pass
+    # over ~450 files; anything approaching this cap means something hung, and a
+    # hung job with no cap burns six hours of billed time saying nothing.
+    timeout-minutes: 30
+    steps:
+      # PAT pool: pick whichever pooled account still has REST quota. Inlined
+      # rather than calling scripts/ci/ppap/pat-pool.sh (the canonical copy —
+      # keep the two in step) because the private-repo checkout itself needs a
+      # token, so the pool cannot live behind it. GET /rate_limit does not count
+      # against the limit, so probing every token is free.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+          # account reads 5000 — so one account served every job while the rest idled,
+          # which is the concentration the pool exists to prevent. Jobs shuffle
+          # independently, so a fan-out spreads instead of stampeding onto one token.
+          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
+      # The checkout is the UPSTREAM repo — always the freshest main, so the
+      # planner reads current BA spec files (the fork's main is only as fresh
+      # as its last sync). The next step rewires remotes into the fork layout
+      # the skill expects for upstream-slug resolution. No fork sync here —
+      # planning creates no claim refs (sync-agent-fork.yml + the solve job's
+      # own freshen keep the fork current).
+
+      - name: Checkout upstream main
+        uses: actions/checkout@v7
+        with:
+          repository: NamThuanVn/erp-namthuan
+          ref: main
+          token: ${{ env.RESOLVED_PAT }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      # Settings + secrets from the CONTROL repo, wherever this job runs: the
+      # sealed bundle the heartbeat forwarded on a fleet repo, this repo's own
+      # vars on the control repo. Same step as the agent lane's — see its
+      # comment in erp-agent-clear-todo.yml and scripts/agent/run/secret-bundle.mjs.
+      - name: Load hunter config
+        env:
+          PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          BUNDLE: ${{ inputs.bundle || '' }}
+          CONTROLLER_REPO: ${{ inputs.controller_repo || '' }}
+          VARS_JSON: ${{ toJSON(vars) }}
+        run: node scripts/agent/run/secret-bundle.mjs open
+
+      # Never stack two batches. The previous PR's e2e run is the ONLY evidence
+      # that the codemod's judgement holds on real specs, so opening tomorrow's
+      # batch before today's has landed would compound an unverified change —
+      # and a red suite could then no longer be attributed to one batch.
+      - name: Skip while a hunter PR is still open
+        id: guard
+        run: |
+          set -uo pipefail
+          OPEN=$(gh pr list --repo NamThuanVn/erp-namthuan \
+                   --state open --head-prefix chore/strip-timeouts \
+                   --json number --jq 'length' 2>/dev/null || echo 0)
+          # --head-prefix is not universally available; fall back to a listing.
+          if [ "$OPEN" = "0" ] || [ -z "$OPEN" ]; then
+            OPEN=$(gh pr list --repo NamThuanVn/erp-namthuan --state open \
+                     --json number,headRefName \
+                     --jq '[.[] | select(.headRefName | startswith("chore/strip-timeouts"))] | length')
+          fi
+          if [ "${OPEN:-0}" -gt 0 ]; then
+            echo "::notice::a timeout-hunter PR is still open — skipping today's batch"
+            echo 'skip=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'skip=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: ./.github/actions/install
+        if: steps.guard.outputs.skip == 'false'
+
+      - name: Take a batch
+        id: hunt
+        if: steps.guard.outputs.skip == 'false'
+        env:
+          BATCH_MAX: ${{ inputs.batch_max || '400' }}
+        # --apply is REQUIRED to write; the script is dry by default so that a bare
+        # invocation (an operator checking, a harness running it with no args)
+        # cannot rewrite 35 spec files as a side effect. On the schedule trigger
+        # `inputs.dry_run` is null, so the daily run takes the --apply branch.
+        run: bash scripts/ci/timeout-hunter.sh ${{ inputs.dry_run && '--dry-run' || '--apply' }}
+
+      # The gate must agree before the PR is opened. If the codemod and the
+      # baseline disagree here, the PR would land red on its own repo-gates job —
+      # better to fail the hunter and leave main untouched.
+      - name: Verify the ratchet agrees
+        if: steps.guard.outputs.skip == 'false' && steps.hunt.outputs.found == 'true'
+        run: bash scripts/gate/shape/no-timeouts.sh
+
+      - name: Open the PR
+        if: steps.guard.outputs.skip == 'false' && steps.hunt.outputs.found == 'true' && !inputs.dry_run
+        env:
+          REMOVED: ${{ steps.hunt.outputs.removed }}
+          FILES: ${{ steps.hunt.outputs.files }}
+          SCOPE: ${{ steps.hunt.outputs.scope }}
+          REMAINING: ${{ steps.hunt.outputs.remaining }}
+        run: |
+          set -euo pipefail
+          BRANCH="chore/strip-timeouts-$(date -u +%Y%m%d)"
+          git config user.name  'timeout-hunter'
+          git config user.email 'noreply@github.com'
+          git checkout -b "$BRANCH"
+          git add -A
+          git commit -F - <<EOF
+          chore(e2e): drop $REMOVED redundant timeouts ($SCOPE)
+
+          Removes inline { timeout: N } overrides that playwright.config.ts's
+          global defaults already cover, across $FILES file(s). Each removal is
+          a value at or below the global backing that exact call shape, so no
+          wait gets shorter.
+
+          Left alone on purpose: values ABOVE their global, per-test budgets,
+          and any call that inherits no global at all (waitForEvent) — those are
+          judgement calls, not boilerplate. $REMAINING removable site(s) remain.
+
+          Generated by .github/ppap/workflows/erp-hunter.yml (hunt-timeouts).
+          The full e2e suite on this PR is the evidence that the batch is safe.
+          EOF
+          git push "https://x-access-token:${RESOLVED_PAT}@github.com/NamThuanVn/erp-namthuan.git" "$BRANCH"
+          gh pr create --repo NamThuanVn/erp-namthuan \
+            --base main --head "$BRANCH" \
+            --title "chore(e2e): drop $REMOVED redundant timeouts ($SCOPE)" \
+            --body "Automated batch from the timeout hunter. $REMOVED override(s) across $FILES file(s); $REMAINING removable site(s) remain.
+
+          Every removal is a value at or below the global that backs its call shape (\`expect.timeout\` 15s, \`expect.toPass.timeout\` 30s, \`use.actionTimeout\` 15s, \`use.navigationTimeout\` 15s), so no wait gets shorter. Values above their global, \`test.setTimeout\`, and calls inheriting no global are deliberately untouched — see [\`remove-test-waits\`](.claude/skills/remove-test-waits/SKILL.md).
+
+          **The full e2e suite on this PR is the evidence.** A failure here is a real finding: it names a spec that was relying on a hand-typed budget."
+
+  # ------------------------------------------------------------------ noise
+  #
+  # The "green is not clean" hunt. erp-ci-pr.yml already counts this residue PER RUN
+  # and blocks auto-merge on it; this pools the SAME tags across the fleet and a
+  # multi-day window, which is the only way a 1-in-30 flake becomes visible —
+  # on any single PR it is green.
+  #
+  # It opens two different things, because the categories divide cleanly:
+  #   • biome warnings have a provable mechanical fix (`biome check --write`), so
+  #     they get a PR, batched exactly like the timeout hunt's.
+  #   • everything else is a judgement call — which of two responsive branches
+  #     owns a testid, whether a wait is racing a cache hit — so they get a
+  #     RANKED, ATTRIBUTED report in a sticky issue. A codemod that guessed at
+  #     those would land an unreviewable diff across 400 specs, and the e2e run
+  #     judging it could not be bisected.
+  #
+  # Never fails the workflow. Its product is a report and an issue; a red daily
+  # job that nobody can act on is itself noise.
+  hunt-noise:
+    name: Hunt CI noise
+    runs-on: ubuntu-latest
+    outputs:
+      # What the `kill` job below acts on, and what `hunt-fresh` acts on when
+      # both are empty. Kept as job outputs rather than an artifact because
+      # they gate a job's `if:`, which is evaluated before any step runs.
+      sites: ${{ steps.batch.outputs.count }}
+      keys: ${{ steps.batch.outputs.keys }}
+      fixable: ${{ steps.scan.outputs.fixable_files }}
+      summary: ${{ steps.scan.outputs.summary }}
+      held: ${{ steps.held.outputs.blocked }}
+      open_pr: ${{ steps.guard.outputs.open_pr }}
+      open_branch: ${{ steps.guard.outputs.open_branch }}
+    # ~1.5k REST calls for a 7-day window over the 16-repo fleet (two run
+    # listings per repo, one job listing per run, one log download per
+    # test-bearing job), six in flight at a time. Measured serially at ~35
+    # minutes for a 5-day window, so a pooled run has a lot of headroom under
+    # this cap; anything approaching it means a download is hanging, and an
+    # uncapped hang bills six hours to say nothing.
+    timeout-minutes: 45
+    steps:
+      # Same inlined PAT pool as hunt-timeouts above, and for the same reason:
+      # the private-repo checkout needs a token, so the pool cannot live behind
+      # it in a composite action. scripts/ci/ppap/pat-pool.sh is the canonical
+      # copy — keep all three in step.
+      #
+      # BYTE-IDENTICAL to the other 31 copies, and it has to stay that way:
+      # scripts/gate/ci/pat-pool-drift.mjs fails the build on any divergence,
+      # because 32 hand-maintained copies that are allowed to differ stop being
+      # one resolver. So the note that belongs to THIS job lives out here rather
+      # than inside the body — the sweep is the fleet's single biggest REST
+      # consumer (~1.5k calls), so the body's own "below 500 remaining" warning
+      # is generous for it: a pooled token near that floor will be throttled
+      # mid-sweep and the report will describe a partial window as a whole one.
+      # The `truncated` line in the report is what catches that after the fact.
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+          # account reads 5000 — so one account served every job while the rest idled,
+          # which is the concentration the pool exists to prevent. Jobs shuffle
+          # independently, so a fan-out spreads instead of stampeding onto one token.
+          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
+      - name: Checkout upstream main
+        uses: actions/checkout@v7
+        with:
+          repository: NamThuanVn/erp-namthuan
+          ref: main
+          token: ${{ env.RESOLVED_PAT }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      # Settings + secrets from the CONTROL repo, wherever this job runs: the
+      # sealed bundle the heartbeat forwarded on a fleet repo, this repo's own
+      # vars on the control repo. Same step as the agent lane's — see its
+      # comment in erp-agent-clear-todo.yml and scripts/agent/run/secret-bundle.mjs.
+      - name: Load hunter config
+        env:
+          PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          BUNDLE: ${{ inputs.bundle || '' }}
+          CONTROLLER_REPO: ${{ inputs.controller_repo || '' }}
+          VARS_JSON: ${{ toJSON(vars) }}
+        run: node scripts/agent/run/secret-bundle.mjs open
+
+      # ── THE GAP THIS CLOSES ───────────────────────────────────────────────
+      #
+      # A hold standing means the harness is known-broken and a repair is
+      # either in flight or has given up. Sweeping anyway costs a ~2-hour run
+      # to rediscover a fault someone is already fixing — and worse, a second
+      # failure raises a second fingerprint and burns another of only three
+      # repair attempts on the same root cause.
+      #
+      # Only the hunter stops. This reads HUNTER_HOLD; the lanes gate on
+      # AGENT_LOOP_HOLD and never see it.
+      - name: Stand down while the harness is being repaired
+        id: held
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: node scripts/agent/board/recover/hunter-hold.mjs check
+
+      - name: Scan the fleet's CI logs
+        id: scan
+        if: ${{ steps.held.outputs.blocked != 'true' }}
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          DAYS: ${{ inputs.days || '7' }}
+        run: |
+          set -uo pipefail
+          # The fleet list is read from the repo VARIABLE, never inlined here:
+          # PPAP_CI_REPOS grew from 3 repos to 16, and a stale literal would
+          # sweep a fraction of the fleet while reporting a clean window — the
+          # exact way a scanner lies. The script itself refuses an empty list.
+          REPOS="$(gh api repos/NamThuanVn/erp-namthuan/actions/variables/PPAP_CI_REPOS --jq .value 2>/dev/null || true)"
+          if [ -z "$REPOS" ]; then
+            echo "::error::PPAP_CI_REPOS is unset on NamThuanVn/erp-namthuan — the sweep would scan nothing and call the fleet clean"
+            exit 1
+          fi
+          mkdir -p noise
+          # --max-logs is set HERE, above the script's own hand-run default of
+          # 400: a 5-day window over this fleet already offers ~720 job logs, so
+          # 400 would silently describe half the window. The script says when it
+          # truncates, but a scheduled sweep should not need to.
+          PPAP_CI_REPOS="$REPOS" node scripts/ci/noise-hunter.mjs scan \
+            --days "$DAYS" \
+            --max-logs 1200 \
+            --json noise/ci-noise-fleet.json \
+            --markdown noise/ci-noise-fleet.md
+
+      # Which sites this run will actually try to fix. Pure decision, taken
+      # here rather than in the kill job so it can gate that job's `if:` —
+      # a job whose steps all skip still costs a runner and shows up green,
+      # which is exactly how a hunt that did nothing looked like a hunt that
+      # worked.
+      #
+      # scripts/ci/noise-fix.mjs DECIDES (ambient-only, capped, worst first —
+      # see its header); this step only reads the answer out.
+      - name: Pick the fix batch
+        id: batch
+        if: ${{ steps.scan.conclusion == 'success' }}
+        env:
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DAYS: ${{ inputs.days || '7' }}
+        run: |
+          set -uo pipefail
+          BATCH=$(node scripts/ci/noise-fix.mjs plan \
+                    --report noise/ci-noise-fleet.json \
+                    --brief noise/fix-brief.md \
+                    --run-url "$RUN_URL" --days "$DAYS") || BATCH=''
+          if [ -z "$BATCH" ]; then
+            # NOT zero. A planner that crashed has not told us the window is
+            # clean, and reporting zero here would send hunt-fresh off to
+            # sample main on the strength of a failure.
+            echo "::warning::noise-fix planner failed — this sweep kills nothing"
+            echo "count=unknown" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          COUNT=$(printf '%s' "$BATCH" | jq '.count')
+          KEYS=$(printf '%s' "$BATCH" | jq -r '.keys | join(", ")')
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "keys=$KEYS" >> "$GITHUB_OUTPUT"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::notice::nothing ambient to kill in this window"
+          else
+            echo "::notice::killing $COUNT site(s): $KEYS"
+          fi
+
+      - name: Upload the fleet noise report
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-noise-fleet
+          path: noise/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      # Never stack two batches, same rule as hunt-timeouts: the PR's own
+      # five-run fan-out is the only evidence the batch was safe, so opening
+      # tomorrow's before today's has landed makes a red run unattributable —
+      # and the second PR would be cut from a main that still carries the
+      # first one's flake, so its fan-out would fail on work already done.
+      # An already-open hunter PR is ADOPTED, not waited on.
+      #
+      # This used to hold: one open `chore/ci-noise*` PR and every later sweep
+      # skipped the kill entirely, for ever, until a human closed it. A bad
+      # trade both ways — the flakes that PR was fixing stay ambient AND the
+      # ones it never reached are never looked for. #3845 was closed by hand
+      # purely to unblock the next run, which is the shape of a mechanism that
+      # parks itself.
+      #
+      # Only the NEWEST is adopted. Two open hunter PRs should be impossible
+      # (this is what stops a second being opened), but if it ever happens,
+      # picking one deterministically beats guessing, and the older one is
+      # named in the log so a human can see it.
+      - name: Adopt an open hunter PR, if there is one
+        id: guard
+        if: ${{ always() }}
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: |
+          set -uo pipefail
+          OPEN=$(gh pr list --repo NamThuanVn/erp-namthuan --state open \
+                   --json number,headRefName,updatedAt \
+                   --jq '[.[] | select(.headRefName | startswith("chore/ci-noise"))]
+                         | sort_by(.updatedAt) | reverse' 2>/dev/null || echo '[]')
+          N=$(printf '%s' "$OPEN" | jq 'length' 2>/dev/null || echo 0)
+          if [ "${N:-0}" -eq 0 ]; then
+            echo 'open_pr=' >> "$GITHUB_OUTPUT"
+            echo "no hunter PR open — this run starts a fresh batch"
+            exit 0
+          fi
+          PR=$(printf '%s' "$OPEN" | jq -r '.[0].number')
+          BR=$(printf '%s' "$OPEN" | jq -r '.[0].headRefName')
+          echo "open_pr=$PR" >> "$GITHUB_OUTPUT"
+          echo "open_branch=$BR" >> "$GITHUB_OUTPUT"
+          echo "::notice::adopting the open hunter PR #$PR ($BR) — finishing it instead of opening a second"
+          if [ "$N" -gt 1 ]; then
+            echo "::warning::$N hunter PRs are open, which should not happen. Adopting the most recently updated (#$PR); the rest want a human: $(printf '%s' "$OPEN" | jq -r '.[1:][].number' | tr '\n' ' ')"
+          fi
+          exit 0
+
+      # The sticky inventory. ONE issue, refreshed in place — a new issue per day
+      # would bury the trend under 30 duplicates, and the trend (which spec, how
+      # many distinct runs) is the entire product. Closed automatically the day
+      # the window comes back clean, so "issue open" means exactly "the fleet has
+      # noise right now".
+      - name: Open or refresh the sticky ci-noise issue
+        if: ${{ always() && steps.scan.conclusion == 'success' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          FOUND: ${{ steps.scan.outputs.found }}
+          TOTAL: ${{ steps.scan.outputs.total }}
+          RUNS: ${{ steps.scan.outputs.runs }}
+          SUMMARY: ${{ steps.scan.outputs.summary }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          REPO=NamThuanVn/erp-namthuan
+          # Found BY LABEL, not by title. `ci-noise` is unique to this issue, so
+          # someone renaming the title cannot make the hunter open a second one
+          # every morning — which is what a title search would do silently.
+          NUM=$(gh api "repos/$REPO/issues?state=open&labels=ci-noise&per_page=100" \
+                  --jq '.[0].number // empty' 2>/dev/null || true)
+
+          if [ "$FOUND" != true ]; then
+            if [ -n "$NUM" ]; then
+              jq -n --arg b "✅ Fleet sweep clean across $RUNS run(s) — no flaky, no report-only tags, no biome warnings, no vitest stderr. Closing; the hunter reopens this the day noise comes back. ([sweep]($RUN_URL))" \
+                '{body: $b}' | gh api -X POST "repos/$REPO/issues/$NUM/comments" --input - >/dev/null
+              jq -n '{state: "closed", state_reason: "completed"}' \
+                | gh api -X PATCH "repos/$REPO/issues/$NUM" --input - >/dev/null
+              echo "closed #$NUM — the window is clean"
+            else
+              echo "::notice::fleet sweep clean across $RUNS run(s) — nothing to file"
+            fi
+            exit 0
+          fi
+
+          {
+            cat noise/ci-noise-fleet.md
+            printf '\n---\n\n'
+            printf 'Refreshed daily by [`erp-hunter.yml` · hunt-noise](%s). ' "$RUN_URL"
+            printf 'Ranked by DISTINCT PRs first, then runs: a row on six PRs is ambient and will meet '
+            printf 'everyone, while the same count inside one PR is that branch problem and there is '
+            printf 'nothing to fix on `main` (a one-PR row prints as `#3061`, not `1`). '
+            printf 'How to read and act on this: '
+            printf '[ppap-hunters](https://github.com/NamThuanVn/erp-namthuan/blob/main/docs/engineering/platform/ppap-hunters.md). '
+            printf 'Per-category fix guidance: '
+            printf '[hydration double-mount race](https://github.com/NamThuanVn/erp-namthuan/blob/main/docs/engineering/runbooks/hydration-double-mount-race.md) '
+            printf 'for `dup`/`hyd`, '
+            printf '[`remove-test-waits`](https://github.com/NamThuanVn/erp-namthuan/blob/main/.claude/skills/remove-test-waits/SKILL.md) '
+            printf 'for a wait you are tempted to widen.\n\n'
+            printf 'This issue closes itself the day the sweep comes back clean.\n'
+          } > noise/issue-body.md
+
+          if [ -n "$NUM" ]; then
+            jq -n --rawfile b noise/issue-body.md '{body: $b}' \
+              | gh api -X PATCH "repos/$REPO/issues/$NUM" --input - >/dev/null \
+              && echo "refreshed #$NUM — $SUMMARY"
+          else
+            NUM=$(jq -n --rawfile b noise/issue-body.md \
+                    '{title: "CI noise inventory — fleet log sweep", body: $b, labels: ["ci-noise", "chore", "module:infra"]}' \
+                    | gh api -X POST "repos/$REPO/issues" --input - --jq '.number')
+            echo "filed #$NUM — $SUMMARY"
+          fi
+          exit 0
+
+  # ── THE KILL ──────────────────────────────────────────────────────────────
+  #
+  # Everything in hunt-noise HUNTS: it pools the fleet's logs, ranks what it
+  # finds, and picks the sites worth fixing. For its first weeks that is where
+  # the hunter stopped — a nightly report, one sticky issue, and only biome
+  # warnings ever actually repaired, because `biome check --write` was the one
+  # provable mechanical fix. Every other finding waited for a human to read the
+  # inventory and volunteer, which measurably did not happen: sites sat there
+  # for weeks while each new PR met them in turn. Filing an issue per site was
+  # tried next and was no better — it moves the waiting rather than ending it,
+  # and it buries a board humans also use.
+  #
+  # So this job fixes them. One branch carrying both halves of the repair —
+  # biome's own mechanical rewrite, and a headless Claude session for the
+  # flakes, which are judgement calls no codemod can make — then ONE pull
+  # request, proved by five parallel fleet CI runs before anything merges.
+  #
+  # WHY FIVE, AND WHY IN PARALLEL. One green run proves almost nothing about a
+  # flake: a site that fails one run in thirty is green on almost every run,
+  # which is how it survived long enough to be found by a pooled sweep in the
+  # first place. Runs in different ppap repos hold separate `ci-<pr>`
+  # concurrency groups, so none of them cancels another — which is why this is
+  # a fan-out and not five sequential re-runs of an hour.
+  #
+  # Five runs, NOT five at once. A run occupies ~5 repos (its coordinator plus
+  # the e2e workers it recruits), so a 16-repo fleet carries three at a time.
+  # prove-clean therefore goes in WAVES: it takes what the fleet can carry,
+  # waits for those repos to come back, and takes the rest. Asking for five in
+  # one capacity-capped wave returns three, compares `3 >= 5`, and fails on
+  # every fleet this size — which is exactly what shipped in #3834 and was
+  # fixed in #3838 before the first real run. A bar nobody can clear stops the
+  # thing it was meant to gate.
+  #
+  # WHAT IT WILL NOT DO. It never merges on its own authority: clearing the bar
+  # adds the `auto-merge` label, and the repo's existing machinery lands the PR
+  # once its own required checks are green. A fan-out that comes back dirty
+  # leaves the PR open with the evidence on it, and tomorrow's sweep holds
+  # (see `Hold the kill…` above) until a human has looked.
+  kill:
+    name: Kill the noise
+    needs: hunt-noise
+    # Three conditions, and the middle one is the one that is easy to get
+    # wrong: `sites` is the string `unknown` when the planner crashed, which
+    # is neither a count nor zero and must not be read as "go".
+    #
+    # `smoke` runs it regardless of what the sweep found: the point is to
+    # exercise the WIRING, and a night with nothing to kill is exactly when a
+    # broken step would otherwise go unnoticed until the next real batch.
+    if: >-
+      ${{ !inputs.dry_run
+          && needs.hunt-noise.outputs.held != 'true'
+          && (inputs.smoke
+              || needs.hunt-noise.outputs.open_pr != ''
+              || ((needs.hunt-noise.outputs.sites != '0'
+                   && needs.hunt-noise.outputs.sites != 'unknown'
+                   && needs.hunt-noise.outputs.sites != '')
+                  || needs.hunt-noise.outputs.fixable != '')) }}
+    runs-on: ubuntu-latest
+    # A fixer session plus five watched CI runs. The session is bounded by the
+    # harness's own budgets; the fan-out is ~20 min for the slowest run. Five
+    # hours is the same order as an agent lane (330 min) and well inside the
+    # six-hour job ceiling.
+    timeout-minutes: 300
+    steps:
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+          # account reads 5000 — so one account served every job while the rest idled,
+          # which is the concentration the pool exists to prevent. Jobs shuffle
+          # independently, so a fan-out spreads instead of stampeding onto one token.
+          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
+      - name: Checkout upstream main
+        uses: actions/checkout@v7
+        with:
+          repository: NamThuanVn/erp-namthuan
+          ref: main
+          token: ${{ env.RESOLVED_PAT }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Settings + secrets from the CONTROL repo, wherever this job runs: the
+      # sealed bundle the heartbeat forwarded on a fleet repo, this repo's own
+      # vars on the control repo. Same step as the agent lane's — see its
+      # comment in erp-agent-clear-todo.yml and scripts/agent/run/secret-bundle.mjs.
+      - name: Load hunter config
+        env:
+          PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          BUNDLE: ${{ inputs.bundle || '' }}
+          CONTROLLER_REPO: ${{ inputs.controller_repo || '' }}
+          VARS_JSON: ${{ toJSON(vars) }}
+        run: node scripts/agent/run/secret-bundle.mjs open
+
+      # The sweep's own output, not a second scan. Re-deriving it here would
+      # cost another ~1.5k REST calls and — worse — could disagree with the
+      # batch the gate above was evaluated on, so the job would fix a
+      # different set of sites than the one it was started for.
+      # Into RUNNER_TEMP, NOT the checkout. These are the sweep's own outputs —
+      # a JSON report, a markdown table and a generated brief — and dropping
+      # them in the worktree puts them inside `git add -A`'s reach. Measured:
+      # run 35602930767 staged all three, and lefthook's pre-commit biome gate
+      # then rejected `ci-noise-fleet.json` for formatting, so the kill job
+      # died on the formatting of a file it never meant to commit.
+      - name: Take the sweep's report and fix brief
+        uses: actions/download-artifact@v7
+        with:
+          name: ci-noise-fleet
+          path: ${{ runner.temp }}/noise/
+
+      # BEFORE the branch switch below, and that ordering is the whole point.
+      #
+      # Adopting checks out the PR's own branch, which replaces the working
+      # tree with THAT branch's copy of the repo — including this very script.
+      # A hunter PR is cut from whatever `main` was when it opened, so its copy
+      # can predate the continue mode entirely: run 35703945588 failed with
+      # "--report is required and must parse" because it was executing #3885's
+      # month-old noise-fix.mjs, not main's. The brief is written here, while
+      # the tree is still main's, and lands in RUNNER_TEMP, which the checkout
+      # cannot touch.
+      #
+      # Adopting an open PR? The sweep's batch is not what this run is for —
+      # finishing #N is. Overwriting the brief keeps that decision with the
+      # guard rather than teaching hunt-noise about it.
+      - name: Write the continue brief when adopting a PR
+        if: ${{ needs.hunt-noise.outputs.open_pr != '' }}
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # The PR's own CI comment carries the run log — one row per run, with
+          # the head each was measuring. That is what lets a recalled session
+          # see which sites survived an earlier fix, i.e. which explanations
+          # have already been tried and disproved. Best-effort: a comment that
+          # cannot be read costs the hindsight, not the run.
+          gh api "repos/NamThuanVn/erp-namthuan/issues/${{ needs.hunt-noise.outputs.open_pr }}/comments" \
+            --jq '[.[] | select(.body | startswith("<!-- ci-report -->"))][0].body // ""' \
+            > "$RUNNER_TEMP/noise/pr-comment.md" 2>/dev/null || : > "$RUNNER_TEMP/noise/pr-comment.md"
+          node scripts/ci/noise-fix.mjs plan \
+            --continue-pr "${{ needs.hunt-noise.outputs.open_pr }}" \
+            --continue-branch "${{ needs.hunt-noise.outputs.open_branch }}" \
+            --run-url "$RUN_URL" \
+            --round "${{ inputs.round || '1' }}" \
+            --run-log "$RUNNER_TEMP/noise/pr-comment.md" \
+            --brief "$RUNNER_TEMP/noise/fix-brief.md"
+          echo "✓ brief rewritten to finish PR #${{ needs.hunt-noise.outputs.open_pr }} (round ${{ inputs.round || '1' }})"
+
+      # The SAME layout every agent lane uses, and for the same reason: the
+      # session ships with /ship-pr, which pushes to `origin` and opens the PR
+      # against `upstream`. Give it anything else and /ship-pr — a command
+      # written for that layout and exercised by every lane — would have to
+      # learn a second one.
+      #
+      # `gh auth setup-git` is what makes the push work at all: the checkout
+      # above is `persist-credentials: false`, so without it the push has no
+      # credential and asks an unattended runner for a username (measured, run
+      # 35602930767).
+      - name: Branch + fork layout + identity
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          OPEN_PR: ${{ needs.hunt-noise.outputs.open_pr }}
+          OPEN_BRANCH: ${{ needs.hunt-noise.outputs.open_branch }}
+          SMOKE: ${{ inputs.smoke }}
+        run: |
+          set -euo pipefail
+          [ -n "${FORK_REPO:-}" ] || {
+            echo "::error::AGENT_FORK_REPO is unset on this repo — the session has nowhere to push. Set it to the shared agent fork (docs/engineering/platform/ppap-agent-runs.md § Agent runs)."
+            exit 1
+          }
+          # Adopting? Take the PR's own branch. Cutting fresh? A new one.
+          #
+          # A SMOKE run never takes either: `chore/ci-noise*` is the prefix the
+          # adopt guard and the 5-way sampling rule both key on, so a scratch
+          # branch wearing it would be adopted by the next real run and
+          # sampled five ways. `smoke/` is outside every one of those rules.
+          if [ "${SMOKE:-}" = "true" ]; then
+            BRANCH="smoke/hunter-${GITHUB_RUN_ID}"
+          else
+            BRANCH="${OPEN_BRANCH:-chore/ci-noise-$(date -u +%Y%m%d-%H%M)}"
+          fi
+          git remote rename origin upstream
+          git remote add origin "https://github.com/${FORK_REPO}.git"
+          bash scripts/ci/ppap/sync-fork-main.sh "$FORK_REPO"
+          gh auth setup-git
+          gh repo set-default "$FORK_REPO"
+          LOGIN=$(gh api user --jq .login)
+          git config user.name "$LOGIN"
+          git config user.email "${LOGIN}@users.noreply.github.com"
+          if [ -n "${OPEN_BRANCH:-}" ] && [ "${SMOKE:-}" != "true" ]; then
+            # The commits are already on the fork; check them out rather than
+            # branching off main, or the session would "continue" an empty
+            # branch and re-do work that is already in the PR.
+            git fetch origin "$BRANCH"
+            git checkout -B "$BRANCH" "origin/$BRANCH"
+
+            # …and then bring main IN. Checking out the PR's branch replaces
+            # the whole working tree with that branch's copy of the repo,
+            # tooling included — so a PR cut a week ago runs the session on a
+            # week-old scripts/agent/run/claude.sh, which may not even have the
+            # mode this job invokes. It also means the session would be fixing
+            # flakes against a base nobody is on any more.
+            #
+            # A conflict is not this job's to resolve: it means the PR needs a
+            # human or a session that can read the conflict, so leave the
+            # branch as it was and say so rather than guessing at a merge.
+            git fetch upstream main
+            if git merge --no-edit upstream/main; then
+              echo "✓ merged main into $BRANCH — the session runs current tooling against a current base"
+            else
+              git merge --abort || true
+              echo "::warning::$BRANCH conflicts with main; continuing on the branch as-is. The session is running OLDER tooling from that branch and fixing against an older base — if it cannot resolve this, the PR wants a human."
+            fi
+            echo "✓ continuing PR #${OPEN_PR} on $BRANCH via $FORK_REPO as @$LOGIN"
+          else
+            git checkout -b "$BRANCH"
+            echo "✓ shipping from $BRANCH via $FORK_REPO as @$LOGIN"
+          fi
+          echo "BRANCH=$BRANCH" >> "$GITHUB_ENV"
+
+      - uses: ./.github/actions/install
+
+      # Biome IS the codemod — the hunter never reimplements a fixer, exactly
+      # as hunt-timeouts borrows strip-timeouts.mjs from the gate. Scoped to
+      # the files the scan named rather than the whole tree, so every hunk is
+      # attributable to a finding.
+      # Left in the tree for the session to ship along with its own fixes —
+      # /ship-pr stages everything, so this needs no commit of its own.
+      - name: Fix the biome warnings the sweep named
+        id: biome
+        if: ${{ needs.hunt-noise.outputs.fixable != '' && needs.hunt-noise.outputs.open_pr == '' }}
+        env:
+          FIXABLE: ${{ needs.hunt-noise.outputs.fixable }}
+        run: |
+          set -uo pipefail
+          # shellcheck disable=SC2086  # FIXABLE is an intentional space-separated path list
+          pnpm exec biome check --write $FIXABLE || true
+          if git diff --quiet; then
+            echo "::notice::biome had nothing left to rewrite in the named files (already fixed on main, or the warning only exists on a branch)"
+          else
+            echo "biome rewrote $(git diff --name-only | wc -l | tr -d ' ') file(s)"
+          fi
+          exit 0
+
+      # Not in smoke: AGENT_SMOKE exits before the CLI is ever invoked, and
+      # installing it would add ~30s to a path whose whole point is speed.
+      # Otherwise this MUST mirror the fixer's `if:` — an adopting round with
+      # zero new sites still runs the session, and run 36784061721 died there
+      # with `claude: command not found` (rc=127).
+      - name: Install Claude Code CLI
+        if: ${{ !inputs.smoke && (needs.hunt-noise.outputs.open_pr != '' || needs.hunt-noise.outputs.sites != '0') }}
+        env:
+          CLAUDE_VERSION: 'latest'
+        run: |
+          set -euo pipefail
+          curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_VERSION"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/claude" --version
+
+      # Explicit `model` input > the stored AGENT_MODELS setting > opus
+      # (issue #4751). Same resolver + precedence every other Claude workflow
+      # uses (erp-agent-clear-todo.yml, erp-agent-ambulance.yml); hunter had
+      # no model plumbing at all before this. Mirrors the fixer's own `if:` —
+      # resolving a model nobody is going to spend is wasted work.
+      - name: Resolve model
+        if: ${{ inputs.smoke || needs.hunt-noise.outputs.open_pr != '' || needs.hunt-noise.outputs.sites != '0' }}
+        env:
+          EXPLICIT: ${{ inputs.model }}
+          # AGENT_MODELS is in the job env from "Load hunter config".
+        run: |
+          set -euo pipefail
+          MODEL=$(scripts/ci/ppap/resolve-model.sh hunter)
+          echo "CLAUDE_MODEL=$MODEL" >> "$GITHUB_ENV"
+
+      # The flakes themselves. A codemod cannot do this — which of two
+      # responsive branches owns a testid, whether a wait is racing a cache
+      # hit, is a judgement call, and a guess would land unreviewable diffs
+      # across 400 specs. So it is a real headless session, on the same
+      # token-pool wrapper the agent fleet uses (scripts/agent/run/claude.sh,
+      # HUNT mode): account ranking by remaining quota, mid-run failover,
+      # transient-5xx retries and a full transcript, none of which is worth a
+      # second implementation here.
+      #
+      # It fixes AND ships: the brief tells it to run /ship-pr and drive the
+      # PR's CI to truly clean, and HUNT_BRANCH lets the harness own the CI
+      # wait so a turn ending with the PR open is resumed rather than lost.
+      #
+      # `continue-on-error` because a session that dies halfway may still have
+      # opened a PR worth looking at, and because a dead session must not take
+      # the sticky issue and the rest of the run down with it. The step after
+      # says plainly what happened.
+      - name: Fix the flaky sites and ship the PR
+        id: fixer
+        if: ${{ inputs.smoke || needs.hunt-noise.outputs.open_pr != '' || needs.hunt-noise.outputs.sites != '0' }}
+        continue-on-error: true
+        env:
+          CLAUDE_CODE_OAUTH_TOKENS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKENS }}
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          HUNT_BRIEF: ${{ runner.temp }}/noise/fix-brief.md
+          HUNT_BRANCH: ${{ env.BRANCH }}
+          AGENT_STATE_DIR: ${{ runner.temp }}
+          # Runs mode detection, the env preconditions and the budget
+          # resolution, then stops. That is where both of the expensive
+          # env faults lived, and it costs a second instead of a session.
+          AGENT_SMOKE: ${{ inputs.smoke && '1' || '' }}
+        run: |
+          # On a fleet repo the Claude pool came forwarded (see "Load hunter config").
+          # shellcheck source=/dev/null
+          if [ -n "${LANE_SECRETS:-}" ]; then . "$LANE_SECRETS"; fi
+          exec bash scripts/agent/run/claude.sh
+
+      # `continue-on-error` above keeps a half-finished session's edits, which
+      # is right — but it also reports a session that never started as a green
+      # step. Run 35602930767 read `Fix the flaky sites: success` while the
+      # session had died on its first line. Say so instead.
+      - name: Say plainly whether the fixer survived
+        if: ${{ always() && steps.fixer.outcome == 'failure' }}
+        run: |
+          echo "::warning::the fixer session exited non-zero — shipping only whatever it left in the tree, which may be nothing. Its transcript is in the hunter-fixer-session artifact."
+          exit 0
+
+      - name: Upload the fixer session
+        if: ${{ always() && steps.fixer.conclusion != 'skipped' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: hunter-fixer-session
+          path: ${{ runner.temp }}/agent-*.json*
+          retention-days: 14
+          if-no-files-found: ignore
+
+      # Nothing here commits, pushes, opens a PR, fans out or merges. The
+      # session does all five by running /ship-pr, exactly as a task lane
+      # does, and then drives its own PR's CI with /fix-ci.
+      #
+      # Those five used to be workflow steps, and it was the wrong place for
+      # them. A step can commit and open a PR; it cannot read a failing shard
+      # log, work out which signal the spec is racing, and push a fix — so the
+      # best it could ever do was report that the bar was unmet and stop. That
+      # is the job the session is already good at, and /ship-pr + /fix-ci are
+      # already the repo's answer for it, tested by every lane that ships.
+      #
+      # What the harness contributes is the part a headless turn cannot do for
+      # itself: a turn ending with the PR open parks on the harness-owned CI
+      # wait and is resumed with the settled result, so a ~20-minute run does
+      # not cost a continuation per poll. Terminal = the PR MERGED, via the
+      # API. See scripts/agent/run/claude.sh § HUNT mode.
+      # ── RECALL ────────────────────────────────────────────────────────────
+      #
+      # A hunt is allowed to stop before it finishes: once its PR is pushed,
+      # the next run adopts it. But "the next run" was the nightly one, so a
+      # PR that needed three sessions took three nights — and in the meantime
+      # the sweep holds, so nothing else gets fixed either.
+      #
+      # So it calls itself. A session that ends with its PR open and unmerged
+      # re-dispatches the hunter, which adopts that PR and carries on. Each
+      # recall increments `round`.
+      #
+      # BOUNDED, because this is a workflow that re-triggers itself on the
+      # outcome it is trying to change. Three rounds is roughly a session's
+      # budget times three — enough for a PR that needs a few settle-and-fix
+      # cycles, and short of a loop that would re-run all night on a PR no
+      # session can finish. At the bound it stops and says so; the PR stays
+      # open for a human, and the nightly sweep will still adopt it tomorrow.
+      #
+      # Only ever recalls for a PR that EXISTS and is OPEN. A merged PR is
+      # done, and no PR means nothing shipped — recalling for either would
+      # spend a runner to re-derive what is already known.
+      # ── SMOKE: prove the half a stubbed session cannot ────────────────────
+      #
+      # AGENT_SMOKE covers everything up to the session. This covers what comes
+      # after it: that a commit survives the pre-commit gate and that the push
+      # has a working credential. Those are not theoretical — the push once
+      # asked an unattended runner for `Username for 'https://github.com':`
+      # because the checkout is `persist-credentials: false` and nothing had
+      # run `gh auth setup-git` (run 35602930767).
+      #
+      # A token change to a file git already tracks, so `git add -A` behaves as
+      # it would on a real fix. The branch is deleted at the end whatever
+      # happens — a `smoke/` branch left on the fork is litter, and the `always()`
+      # is what stops a failure above leaving one behind.
+      - name: Smoke — commit and push for real, then clean up
+        if: ${{ inputs.smoke }}
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: |
+          set -uo pipefail
+          printf '\n<!-- hunter smoke %s -->\n' "$GITHUB_RUN_ID" >> docs/engineering/platform/ppap-hunters.md
+          git add -A
+          if git diff --cached --quiet; then
+            echo "::error::smoke staged nothing — 'git add -A' is not seeing the change, which a real fix would hit too"
+            exit 1
+          fi
+          if ! git commit -q -m "chore(ci): hunter smoke run ${GITHUB_RUN_ID}"; then
+            echo "::error::smoke could not commit — the pre-commit gate rejected a one-line docs change, so it would reject a real fix too. Read the gate output above."
+            exit 1
+          fi
+          if ! git push "https://x-access-token:${RESOLVED_PAT}@github.com/${FORK_REPO}.git" "$BRANCH"; then
+            echo "::error::smoke could not push — a real session would reach this point with a finished fix and lose it. Check gh auth setup-git and the pooled PAT's scope."
+            exit 1
+          fi
+          echo "✓ smoke: commit survived the pre-commit gate and the push authenticated"
+
+      - name: Smoke — delete the scratch branch
+        if: ${{ always() && inputs.smoke }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: |
+          set -uo pipefail
+          case "${BRANCH:-}" in
+            smoke/*) ;;
+            *) echo "::warning::refusing to delete '${BRANCH:-}' — smoke only ever deletes a smoke/ branch"; exit 0 ;;
+          esac
+          gh api -X DELETE "repos/${FORK_REPO}/git/refs/heads/${BRANCH}" >/dev/null 2>&1 \
+            && echo "✓ smoke: deleted ${BRANCH}" \
+            || echo "· smoke: ${BRANCH} was never pushed, nothing to delete"
+          exit 0
+
+      # ── CALL AN AMBULANCE WHEN THE HARNESS BREAKS ─────────────────────────
+      #
+      # The agent lanes have repaired their own harness for months: a lane
+      # dies, a hold is raised, the ambulance runs /repair-harness, and the fix
+      # merges. Three of those landed in scripts/agent/run/claude.sh in two
+      # days — the very file this job runs on. The hunter was the one consumer
+      # outside that loop, and it showed: nineteen harness fixes in two days,
+      # every one diagnosed by a human.
+      #
+      # SCOPED, so a flaky-test fixer crashing cannot stop BA work. The hold
+      # goes in this job's own HUNTER_HOLD variable and travels to the
+      # ambulance in the dispatch payload; AGENT_LOOP_HOLD — the one the lanes
+      # gate on — is never touched. Same trick salvage-or-revert.mjs already
+      # uses for an item-scoped hold.
+      #
+      # Only a HARNESS fault qualifies. A handoff (budget spent, PR open) exits
+      # 0 as `handed-off` and is a success; a session that shipped a PR but
+      # could not finish is the work being hard. Treating either as a fault
+      # would burn one of only three repair attempts on nothing.
+      - name: Call an ambulance if the harness broke
+        if: ${{ always() && !inputs.dry_run && !inputs.smoke }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          AGENT_STATE_DIR: ${{ runner.temp }}
+          JOB_STATUS: ${{ job.status }}
+          # The fixer is `continue-on-error`, so JOB_STATUS alone reads
+          # `success` over a session that never started (run 36784061721).
+          FIXER_OUTCOME: ${{ steps.fixer.outcome }}
+          ADOPTED: ${{ needs.hunt-noise.outputs.open_pr != '' }}
+          FAILED_STEP: ${{ steps.fixer.outcome == 'failure' && 'Fix the flaky sites and ship the PR' || '' }}
+        run: |
+          set -uo pipefail
+          # The exit reason claude.sh recorded, when it got that far. Absent
+          # means it never started — which is itself a harness fault.
+          REASON=$(jq -r '.reason // ""' "$RUNNER_TEMP/agent-exit.json" 2>/dev/null || echo '')
+          PR_OPENED=false
+          if [ -n "${BRANCH:-}" ]; then
+            FORK_OWNER="${FORK_REPO%%/*}"
+            COUNT=$(gh api "repos/NamThuanVn/erp-namthuan/pulls?state=all&head=${FORK_OWNER}:${BRANCH}&per_page=1" --jq 'length' 2>/dev/null || echo 0)
+            [ "${COUNT:-0}" -gt 0 ] && PR_OPENED=true
+          fi
+          node scripts/agent/board/recover/hunter-hold.mjs raise \
+            --step "${FAILED_STEP:-Fix the flaky sites and ship the PR}" \
+            --job-conclusion "${JOB_STATUS}" \
+            --fixer-outcome "${FIXER_OUTCOME:-}" \
+            --exit-reason "$REASON" \
+            --pr-opened "$PR_OPENED" \
+            --adopted "${ADOPTED:-false}" \
+            --error "$(printf '%s' "${REASON:-}" | head -c 200)"
+          exit 0
+
+      - name: Recall the hunter to finish an open PR
+        if: ${{ always() && !inputs.dry_run && !inputs.smoke }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          ROUND: ${{ inputs.round || '1' }}
+          DAYS: ${{ inputs.days || '7' }}
+        run: |
+          set -uo pipefail
+          MAX_ROUNDS=3
+          FORK_OWNER="${FORK_REPO%%/*}"
+          STATE=$(gh api "repos/NamThuanVn/erp-namthuan/pulls?state=all&head=${FORK_OWNER}:${BRANCH}&per_page=5" \
+                    --jq '.[0] | "\(.number) \(.state) \(.merged_at // "-")"' 2>/dev/null || true)
+          if [ -z "$STATE" ] || [ "$STATE" = "null" ]; then
+            echo "no PR for $BRANCH — nothing to recall for"
+            exit 0
+          fi
+          set -- $STATE
+          if [ "${2:-}" != "open" ] || [ "${3:-}" != "-" ]; then
+            echo "PR #$1 is ${2}${3:+ (merged $3)} — no recall needed"
+            exit 0
+          fi
+          if [ "${ROUND:-1}" -ge "$MAX_ROUNDS" ]; then
+            echo "::warning::PR #$1 is still open after $ROUND round(s) — not recalling again. Three sessions could not finish it, so it wants a human. Tonight's sweep will still adopt it."
+            exit 0
+          fi
+          NEXT=$((ROUND + 1))
+          # On a fleet repo the next run gets no secrets but the ones handed to
+          # it: re-seal what this run was given (a fresh expiry) and pass it on.
+          FWD=()
+          if [ -n "${LANE_SECRETS:-}" ]; then
+            # shellcheck source=/dev/null
+            . "$LANE_SECRETS"
+            B=$(node scripts/agent/run/secret-bundle.mjs build) || B=''
+            if [ -n "$B" ]; then FWD=(-f bundle="$B" -f controller_repo="${AGENT_CONTROL_REPO:-}"); fi
+          fi
+          if gh workflow run erp-hunter.yml -R "${GITHUB_REPOSITORY}" \
+               -f dry_run=false -f days="$DAYS" -f fresh_hunt=false -f round="$NEXT" "${FWD[@]}"; then
+            echo "::notice::recalled the hunter (round $NEXT of $MAX_ROUNDS) to adopt PR #$1 and carry on"
+          else
+            echo "::warning::could not recall the hunter — PR #$1 stays open and tonight's sweep will adopt it"
+          fi
+          exit 0
+
+      # Arm the PR the session shipped.
+      #
+      # The label does not merge anything by itself: erp-ci-pr.yml only lands a
+      # labelled PR once the whole wave has reported and every run-log row on
+      # that head is clean (scripts/ci/merge-bar.mjs). Before that bar existed
+      # the label WOULD have merged on the first clean sample, which is why this
+      # workflow withheld it and left merging to a session — one that had to
+      # still be alive, and still have budget, to notice the bar was met. Now
+      # the bar is the authority and the label is only consent, so it is applied
+      # here, deterministically, rather than asked of a session that may already
+      # have handed off.
+      - name: Arm the PR for auto-merge
+        if: ${{ always() && !inputs.dry_run && !inputs.smoke }}
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: |
+          set -uo pipefail
+          FORK_OWNER="${FORK_REPO%%/*}"
+          PR=$(gh api "repos/NamThuanVn/erp-namthuan/pulls?state=open&head=${FORK_OWNER}:${BRANCH}&per_page=5" \
+                 --jq '.[0].number' 2>/dev/null || true)
+          if [ -z "$PR" ] || [ "$PR" = "null" ]; then
+            echo "no open PR for $BRANCH — nothing to arm"
+            exit 0
+          fi
+          # Already armed? Then the SESSION labelled it, which it does while it
+          # still has CI in flight, so those runs see the label and the bar lands
+          # the PR without help. Dispatching another wave here would spend ~12
+          # minutes of fleet re-proving what is already being proved. Measured on
+          # PR #3940, labelled by the session at 13:03 with three runs already
+          # dispatched behind it.
+          ARMED=$(gh api "repos/NamThuanVn/erp-namthuan/issues/$PR/labels" \
+                    --jq '[.[].name] | index("auto-merge") // empty' 2>/dev/null || true)
+          if [ -n "$ARMED" ]; then
+            echo "::notice::PR #$PR is already armed — the session did it, and its own runs will read the bar"
+            exit 0
+          fi
+          if gh api -X POST "repos/NamThuanVn/erp-namthuan/issues/$PR/labels" \
+               -f "labels[]=auto-merge" >/dev/null 2>&1; then
+            echo "::notice::armed PR #$PR with auto-merge — the session did not, so this is the fallback"
+            # …and then give the bar something to be read BY.
+            #
+            # The label changes nothing retroactively. erp-ci-pr.yml evaluates
+            # the merge bar INSIDE a CI run, and this step runs after the session
+            # has finished — so when the session did not label the PR itself, it
+            # also left no run behind to read a label applied now. That is the
+            # case this branch is for: a session that died, ran out of budget or
+            # handed off mid-drive.
+            #
+            # One more wave fixes the ORDERING rather than the logic: its runs
+            # see the label, and its LAST run is the one the bar lets merge.
+            # Sampling accumulates on a head, so these rows add to the ones
+            # already there rather than replacing them — the evidence a dead
+            # session did gather is not thrown away and re-earned.
+            if gh workflow run pr-triage-and-ci-dispatch.yml -R NamThuanVn/erp-namthuan \
+                 -f pr_number="$PR" >/dev/null 2>&1; then
+              echo "::notice::dispatched a wave to evaluate the bar on #$PR — its last clean run merges it"
+            else
+              echo "::warning::could not dispatch the evaluating wave for #$PR; the label stands and its next run will read the bar"
+            fi
+          else
+            echo "::warning::could not label PR #$PR auto-merge; it will need a human to merge"
+          fi
+          exit 0
+
+      - name: Say plainly whether the session got its PR merged
+        if: ${{ always() && !inputs.smoke }}
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: |
+          set -uo pipefail
+          FORK_OWNER="${FORK_REPO%%/*}"
+          PR=$(gh api "repos/NamThuanVn/erp-namthuan/pulls?state=all&head=${FORK_OWNER}:${BRANCH}&per_page=5" \
+                 --jq '.[0] | "\(.number) \(.state) \(.merged_at // "-")"' 2>/dev/null || true)
+          if [ -z "$PR" ] || [ "$PR" = "null" ]; then
+            echo "::warning::the session opened no pull request for $BRANCH — nothing shipped. Its transcript is in the hunter-fixer-session artifact; the sites stay in the sweep and the next run will pick them up again."
+            exit 0
+          fi
+          set -- $PR
+          case "${3:-}" in
+            -) echo "::warning::PR #$1 for $BRANCH is $2 but NOT merged — the fix did not land. Read its CI comment for what the fan-out saw; tomorrow's sweep holds while it is open." ;;
+            *) echo "::notice::PR #$1 merged — the noise it names is gone from main" ;;
+          esac
+          exit 0
+
+  # ── HUNT WHEN THE WINDOW IS QUIET ────────────────────────────────────────
+  #
+  # A pooled window with nothing to kill is not the same as a healthy suite.
+  # It usually means the fleet was IDLE — a weekend, a holiday, a day nobody
+  # opened a PR — so there were no runs to pool and therefore no evidence. The
+  # sweep then reports "clean", files nothing, and the flakes that are still
+  # there wait to be discovered by whoever opens the next PR. That is the
+  # failure this job exists for: on a quiet day, go and MAKE evidence.
+  #
+  # It samples `main` itself, five runs at once, through the same fan-out that
+  # proves a PR (scripts/ci/prove-clean.mjs --main). Sampling the trunk rather
+  # than a branch is what makes the result immediately actionable: a site that
+  # fails on main has no branch to blame, so noise-fix takes it into the batch
+  # on ONE sighting instead of waiting for a second distinct PR
+  # (scripts/ci/noise-fix.mjs § isAmbient). Five at once rather than five in
+  # a row because a concurrency group is scoped to one repository, so five
+  # runs in five ppap repos do not cancel each other — an hour of wall-clock
+  # collapses to one run's worth.
+  #
+  # It does NOT file anything itself. It re-enters the hunter with `days=1`,
+  # and that second pass pools the runs it just created along with the last
+  # day's real traffic, then files and dispatches through exactly the one code
+  # path above. A second copy of the filing logic here is how the two would
+  # drift, and the drift would show up as the hunt cheerfully finding nothing.
+  #
+  # TERMINATION, because this is a workflow that re-triggers itself: the
+  # re-entry passes `fresh_hunt=false`, and this job's `if:` requires it true.
+  # One extra pass, never two, whatever the second pass finds.
+  hunt-fresh:
+    name: Hunt fresh noise on main
+    needs: hunt-noise
+    # The gate is "the sweep found nothing to kill AND nothing is already in
+    # flight": no ambient site, no biome warning, and no open hunter PR. That
+    # last one matters — a run that is finishing an existing PR has plenty to
+    # do, and sampling the trunk on top of it would spend five more runs of
+    # fleet on a question nobody asked. `''` (the step never ran) and `unknown` (the planner
+    # crashed) both fall through and sample nothing — an absent answer is not
+    # a clean one, and sampling the trunk on the strength of a crash would
+    # spend five CI runs to learn what we already failed to read.
+    if: >-
+      ${{ needs.hunt-noise.outputs.held != 'true'
+          && needs.hunt-noise.outputs.sites == '0'
+          && needs.hunt-noise.outputs.fixable == ''
+          && needs.hunt-noise.outputs.open_pr == ''
+          && inputs.fresh_hunt && !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    # Five CI runs dispatched at once and watched to completion: ~20 minutes
+    # for the slowest, plus the poll interval and artifact reads. Double that
+    # and stop — a fan-out still unfinished after an hour has lost a run, and
+    # the next nightly sweep pools whatever did finish anyway.
+    timeout-minutes: 60
+    steps:
+      - name: Resolve PAT from pool
+        env:
+          PAT_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          POOL=$(printf '%s\n' "${PAT_POOL:-}" | tr ',' '\n' | tr -d '[:blank:]' | grep -v '^$')
+          # Shuffle before the scan so EQUAL budgets tie-break evenly. The `-gt` below
+          # keeps the FIRST token on a tie, and a rested pool is ALL ties — every
+          # account reads 5000 — so one account served every job while the rest idled,
+          # which is the concentration the pool exists to prevent. Jobs shuffle
+          # independently, so a fan-out spreads instead of stampeding onto one token.
+          POOL=$(printf '%s\n' "$POOL" | while IFS= read -r T; do printf '%s\t%s\n' "$RANDOM" "$T"; done | sort -n | cut -f2-)
+          BEST=''; BEST_REM=-1
+          while IFS= read -r T; do
+            [ -n "$T" ] || continue
+            echo "::add-mask::$T"
+            R=$(curl -sf -m 15 -H "Authorization: Bearer $T" https://api.github.com/rate_limit \
+                  | jq -r '.resources.core.remaining' 2>/dev/null) || continue
+            case "$R" in ''|*[!0-9]*) continue ;; esac
+            if [ "$R" -gt "$BEST_REM" ]; then BEST="$T"; BEST_REM="$R"; fi
+          done <<< "$POOL"
+          [ -n "$BEST" ] || { echo "::error::PAT_TOKEN_POOL is unset/empty on this repo, or every token in it was unreachable — see docs/engineering/platform/ppap-secrets.md § PAT_TOKEN_POOL"; exit 1; }
+          LOGIN=$(curl -sf -m 15 -H "Authorization: Bearer $BEST" https://api.github.com/user | jq -r '.login')
+          { echo "GH_TOKEN=$BEST"; echo "RESOLVED_PAT=$BEST"; echo "RESOLVED_PAT_LOGIN=$LOGIN"; } >> "$GITHUB_ENV"
+          echo "PAT pool -> @$LOGIN ($BEST_REM core remaining)"
+          if [ "$BEST_REM" -lt 500 ]; then
+            echo "::warning::best pooled PAT has only $BEST_REM core calls left — add another account to PAT_TOKEN_POOL"
+          fi
+          exit 0
+
+      - name: Checkout upstream main
+        uses: actions/checkout@v7
+        with:
+          repository: NamThuanVn/erp-namthuan
+          ref: main
+          token: ${{ env.RESOLVED_PAT }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      # Settings + secrets from the CONTROL repo, wherever this job runs: the
+      # sealed bundle the heartbeat forwarded on a fleet repo, this repo's own
+      # vars on the control repo. Same step as the agent lane's — see its
+      # comment in erp-agent-clear-todo.yml and scripts/agent/run/secret-bundle.mjs.
+      - name: Load hunter config
+        env:
+          PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+          BUNDLE: ${{ inputs.bundle || '' }}
+          CONTROLLER_REPO: ${{ inputs.controller_repo || '' }}
+          VARS_JSON: ${{ toJSON(vars) }}
+        run: node scripts/agent/run/secret-bundle.mjs open
+
+      # Capacity-gated inside the script: it borrows only repos with nothing
+      # in flight, and only floor(idle / 5) of them, because one CI run
+      # occupies roughly five repos (its coordinator plus the e2e workers it
+      # recruits). On a busy fleet it starts fewer than five, or none, and
+      # says so. That gate is not a nicety — an earlier version counted
+      # coordinator slots only, started five runs on a sixteen-repo fleet that
+      # needs twenty-five, and two died with 403s polling a batch repo a
+      # sibling had taken. The fan-out manufactured the noise it was measuring.
+      - name: Sample main for fresh evidence
+        id: sample
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+        run: node scripts/ci/prove-clean.mjs --main --need 5 --go
+
+      # Back through the front door. `days=1` keeps the second sweep cheap and
+      # untruncated: the 7-day window routinely offers more logs than
+      # --max-logs will read, and a truncated window under-counts ambience
+      # specifically — a site needs a second sighting to qualify, and
+      # truncation drops exactly those. The runs we just made are minutes old,
+      # so one day is all this pass needs.
+      - name: Re-enter the hunter over the evidence it just made
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.RESOLVED_PAT }}
+          PAT_TOKEN_POOL: ${{ secrets.PAT_TOKEN_POOL }}
+        run: |
+          set -uo pipefail
+          # On a fleet repo the next run gets no secrets but the ones handed to
+          # it: re-seal what this run was given (a fresh expiry) and pass it on.
+          FWD=()
+          if [ -n "${LANE_SECRETS:-}" ]; then
+            # shellcheck source=/dev/null
+            . "$LANE_SECRETS"
+            B=$(node scripts/agent/run/secret-bundle.mjs build) || B=''
+            if [ -n "$B" ]; then FWD=(-f bundle="$B" -f controller_repo="${AGENT_CONTROL_REPO:-}"); fi
+          fi
+          if gh workflow run erp-hunter.yml -R "${GITHUB_REPOSITORY}" \
+               -f dry_run=false -f days=1 -f fresh_hunt=false "${FWD[@]}"; then
+            echo "✓ re-entered the hunter over a 1-day window (fresh_hunt=false — this cannot chain again)"
+          else
+            echo "::warning::could not re-enter the hunter — the sampling runs are in the fleet's logs and tonight's sweep will pool them anyway, a day later than intended"
+          fi
+          exit 0
